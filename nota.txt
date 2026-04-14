@@ -5,3 +5,13 @@ Diferidos 2025: Existen tablas separadas (pr_creditos_dif_2025, pr_creditos_dif_
 Si,PR_CREDITOS_DIF_POST y pr_cred_dif_post_hi
 Reversiones: Qué situación específica causó las reversiones en Feb/Mar 2026? (ej: créditos castigados dos veces, castigo de créditos que no cumplían condición, etc.)
 castigo de créditos que no cumplían condición
+
+
+Para poder avanzar con la implementación, aún necesito que me confirmes estos puntos:
+Empresa 5 (BDP): Sigue la lógica de empresa 1 (BUSA) o de empresa 11 (Fassil) para contabilización e inserción en PR_DET_CAST_PROD_DIF?
+
+Estructura de PR_CREDITOS_DIF_POST / pr_cred_dif_post_hi: Tienen las mismas columnas que pr_creditos_dif / pr_creditos_dif_hi? (interes_castigado_contab, interes_suspenso_contab, monto_interes_dif, monto_pagado_interes_dif, saldo_interes_dif, interes_corriente_contab)
+
+Transacción contable para diferidos 2025: Usa la misma transacción 220 o tiene un código diferente?
+
+Validación anti-reversión: Tienes alguna hipótesis de por qué el EXISTS con pr_his_calif_x_pr_tramite dejó pasar créditos que no cumplían? (ej: datos de calificación faltantes, num_proceso incorrecto, etc.)
