@@ -2,5 +2,6 @@ Preguntas para continuar
 Empresa 5 (BDP): Debe seguir la misma lógica que empresa 1 (BUSA) o empresa 11 (Fassil) para la contabilización y el detalle en PR_DET_CAST_PROD_DIF?
 
 Diferidos 2025: Existen tablas separadas (pr_creditos_dif_2025, pr_creditos_dif_2025_hi) o se usa la misma tabla pr_creditos_dif con un campo que identifique el tipo de diferimiento?
-
+Si,PR_CREDITOS_DIF_POST y pr_cred_dif_post_hi
 Reversiones: Qué situación específica causó las reversiones en Feb/Mar 2026? (ej: créditos castigados dos veces, castigo de créditos que no cumplían condición, etc.)
+castigo de créditos que no cumplían condición
