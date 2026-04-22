@@ -1,0 +1,68 @@
+Causa 1 — Contagio mal aplicado (más probable)
+PR_CASTIGO_PROD_DIF verifica la calificación leyendo pr_his_calif_x_pr_tramite después de que PR_CONTAGIO ya actualizó esa tabla.
+
+El EXISTS en los 4 bloques hace:
+
+
+AND EXISTS (SELECT 1
+              FROM  pr_his_calif_x_pr_tramite calif
+            WHERE  calif.cod_empresa = p_empresa
+               and calif.num_proceso = p_num_proceso
+               and calif.num_tramite  = to_number(h.num_tramite)
+               and (calif.cod_calif IN ('D','E','F') or calif.num_dias_mora >90))
+PR_CONTAGIO propaga la peor calificación a todos los trámites del mismo cliente. Entonces puede ocurrir esto:
+
+
+Tramite 100: mora = 60 días, calif = B  ← crédito "sano"
+Tramite 200: mora = 95 días, calif = D  ← otro crédito del mismo cliente
+
+Después de PR_CONTAGIO:
+  → Tramite 100: cod_calif = 'D'  (contagiado desde Tramite 200)
+
+PR_CASTIGO_PROD_DIF lee cod_calif='D' para Tramite 100
+  → lo castiga aunque mora=60 y calificación original=B
+El usuario verifica en la tabla de créditos y ve mora ≤ 90 y calificación B, pero pr_his_calif_x_pr_tramite ya tiene D por efecto del contagio.
+
+Causa 2 — num_dias_mora proviene de dos fuentes distintas
+El EXISTS usa calif.num_dias_mora de pr_his_calif_x_pr_tramite, no de pr_creditos_hi. Si estos valores no están sincronizados:
+
+Tabla	num_dias_mora	Resultado
+pr_creditos_hi (h)	85 días	Usuario ve: no supera 90
+pr_his_calif_x_pr_tramite (calif)	93 días	EXISTS devuelve TRUE
+El crédito entra al castigo por la condición num_dias_mora > 90, aunque el campo h.num_dias_mora dice 85.
+
+Query diagnóstico para confirmar
+Ejecutar esto después de un proceso para detectar los casos incorrectos:
+
+
+SELECT h.no_credito,
+       h.num_tramite,
+       h.num_dias_mora          AS mora_en_creditos_hi,
+       calif.cod_calif           AS calif_post_contagio,
+       calif.num_dias_mora       AS mora_en_calif_tabla,
+       det.id_movimiento
+FROM   pr_creditos_hi h
+JOIN   pr_creditos_dif_hi dif
+       ON  dif.cod_empresa      = h.codigo_empresa
+       AND dif.fec_registro_hi  = h.fec_registro_hi
+       AND dif.no_credito       = h.no_credito
+JOIN   pr_his_calif_x_pr_tramite calif
+       ON  calif.cod_empresa    = h.codigo_empresa
+       AND calif.num_proceso    = :p_num_proceso
+       AND calif.num_tramite    = to_number(h.num_tramite)
+LEFT JOIN pr_det_cast_prod_dif det
+       ON  det.codigo_empresa   = h.codigo_empresa
+       AND det.no_credito       = h.no_credito
+WHERE  h.codigo_empresa         = :p_empresa
+AND    h.fec_registro_hi        = :p_fecha
+AND    det.id_movimiento        IS NOT NULL          -- fue castigado
+AND    h.num_dias_mora          <= 90                -- mora no supera 90 en pr_creditos_hi
+AND    calif.cod_calif          NOT IN ('D','E','F') -- calif original no es mala
+ORDER BY h.num_tramite;
+Si retorna registros, confirma la Causa 1 (contagio). Si calif.num_dias_mora > 90 en esos registros, confirma la Causa 2.
+
+Dónde está la raíz del problema
+Causa	Dónde corregir
+Contagio propaga D/E/F a trámites sanos	PR_CONTAGIO — revisar la condición HAVING y el OR de la calificación manual (cod_cm_max)
+num_dias_mora desincronizado	Verificar que al poblar pr_his_calif_x_pr_tramite se use el valor correcto de mora
+¿Puedes ejecutar el query diagnóstico y compartir si devuelve resultados? Eso nos dirá exactamente cuál de las dos causas se está disparando.

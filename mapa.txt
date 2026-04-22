@@ -1,0 +1,255 @@
+Proceso Integral de Castigo de Productos Diferidos
+Visión general del flujo
+
+┌─────────────────────────────────────────────────────────────────┐
+│                     FORMULARIO PR0047                           │
+│                                                                 │
+│  [Ejecutar Castigo]          [Ejecutar Castigo Diferido]        │
+│       ↓                               ↓                         │
+│  PA.CTRL_REG_DAT_PROCESO        PA.CTRL_REG_DAT_PROCESO         │
+│  + Principal                    + PR_CASTIGO_PROD_DIF           │
+└─────────────────────────────────────────────────────────────────┘
+         ↑
+         │  El usuario opera desde aquí. El sistema tiene
+         │  dos botones separados con lógicas distintas.
+         │
+         └── PREREQUISITO: que PR_PROVISIONES tenga PROVISIONADO='S'
+             para poder obtener el NUM_PROCESO
+Fase 1 — Calificación Automática (pr_calif_automatica)
+Esta fase corre antes que el usuario abra PR0047. Determina la calificación de cada crédito.
+
+
+Para cada trámite/crédito:
+│
+├─ Califica_X_Mora
+│    └── Por días de mora según tabla normativa ASFI
+│        A: 0-5 días / B: 6-30 / C: 31-90 / D: 91-180 / etc.
+│
+├─ Califica_X_Ejecucion4
+│    └── Créditos en ejecución judicial → mínimo F
+│        (varía según garantías hipotecarias: F, G o H)
+│
+├─ Califica_X_Reprogramacion
+│    └── Créditos reprogramados → baja la calificación automáticamente
+│
+├─ Califica_Op_Cliente
+│    └── Consolida todas las calificaciones del trámite
+│        y aplica la PEOR (más restrictiva)
+│
+├─ Obt_Calif_Entes_Calif
+│    └── Calificación por entes externos (PROHIB, etc.)
+│        SB494: clientes prohibidos → calificación fija
+│
+└─ Resultado: graba en pr_his_calif_x_pr_tramite
+              (cod_empresa, num_proceso, num_tramite, cod_calif, num_dias_mora)
+Tablas afectadas:
+
+pr_his_calif_x_pr_tramite → calificación por trámite
+pr_calif_x_cliente → calificación consolidada por cliente
+pr_consolidado_creditos_his → resumen histórico
+Fase 2 — Contagio (PR_CONTAGIO)
+Corre inmediatamente después de la calificación. Propaga la peor calificación entre operaciones del mismo cliente.
+
+
+WHILE existen diferencias de calificación LOOP
+
+    Para cada persona (cod_persona):
+    │
+    ├─ Obtiene cod_cm_max  = peor calificación MANUAL
+    │   (solo créditos tipo P0, C3, P5, P6, C0 con saldo >400k USD)
+    │
+    ├─ Obtiene cod_calif_max = peor calificación del proceso
+    │
+    └─ Si hay diferencia entre trámites del mismo cliente:
+         UPDATE pr_his_calif_x_pr_tramite
+            SET cod_calif = NVL(cod_cm_max, cod_calif_max)  ← peor de todas
+          WHERE ... todos los trámites de esa persona
+
+         UPDATE pr_calif_x_cliente (calificación global del cliente)
+         UPDATE pr_consolidado_creditos_his
+
+END LOOP  ← itera hasta que no haya más diferencias
+
+Ejemplo de contagio:
+
+
+Antes del contagio:
+  Tramite 100 (persona A): cod_calif = 'B', mora = 45 días
+  Tramite 200 (persona A): cod_calif = 'D', mora = 120 días
+
+Después del contagio:
+  Tramite 100 (persona A): cod_calif = 'D'  ← contagiado
+  Tramite 200 (persona A): cod_calif = 'D'
+
+→ El castigo diferido afectará al Tramite 100 aunque
+  su mora sea solo 45 días.
+Contagio inter-empresa (parámetro CONTAGIO_INTER_EMP):
+
+
+Si el parámetro = '|1|5|11|' (no 'N'):
+  La empresa donde se ejecuta NO está en la lista
+  → se buscan procesos de OTRAS empresas de la misma fecha
+  → se propaga la peor calificación entre empresas del grupo
+Fase 3 — Provisión
+El sistema crea un registro en PR_PROVISIONES con PROVISIONADO='S' una vez que el proceso de calificación y provisión contable ha terminado. Este registro es el que el formulario PR0047 consulta para obtener el NUM_PROCESO.
+
+Fase 4 — Castigo de Diferidos (PR_CASTIGO_PROD_DIF)
+El usuario presiona "Ejecutar Castigo Diferido" en PR0047. El formulario hace:
+
+
+-- 1. Obtiene el proceso (acá puede estar el bug)
+SELECT MAX(NUM_PROCESO)
+  INTO vl_NumProceso
+  FROM PR_PROVISIONES
+ WHERE COD_EMPRESA = :variables.codeampresa
+   AND PROVISIONADO = 'S';
+   -- ← sin filtro de fecha → puede traer proceso de otro mes
+
+-- 2. Llama al procedimiento
+PR.PR_CASTIGO_PROD_DIF(
+    :Variables.CodEmpresa,  -- empresa
+    vl_NumProceso,          -- num_proceso (posiblemente incorrecto)
+    :variables.fecha,       -- fecha de corte
+    :Variables.CodAgencia,  -- agencia
+    vl_Error
+);
+Dentro del procedimiento, se ejecutan 4 bloques en secuencia:
+
+Bloque 1: Diferidos con saldo capital > 0
+
+Fuente: pr_creditos_hi + pr_creditos_dif_hi
+
+Filtros:
+  ✓ saldo_actual > 0                          (tiene capital pendiente)
+  ✓ (monto_interes_dif - monto_pagado) > 0.01  (tiene diferido pendiente)
+  ✓ saldo_interes_dif > 0
+  ✓ estado NOT IN ('C','N','I','L')
+  ✓ EXISTS en pr_his_calif_x_pr_tramite:
+      cod_calif IN ('D','E','F')
+      OR num_dias_mora > 90
+      (usando el num_proceso que pasó el form)
+
+Para cada crédito que cumple:
+│
+├─ 1ra iteración → crea cabecera contable (Cg_Utl.Caratula_del_Asiento)
+│     Aplicación: BPR / Sub-aplic: 201 / Transacción: 8
+│
+├─ Empresas 11 (Fassil) y 5 (BDP):
+│     INSERT PR_DET_CAST_PROD_DIF
+│     (guarda snapshot antes/después del castigo)
+│
+├─ UPDATE pr_creditos_dif (tabla vigente):
+│     interes_castigado_contab += interes_diferidos
+│     interes_suspenso_contab  += interes_diferidos
+│     monto_interes_dif        -= interes_diferidos
+│     interes_corriente_contab -= interes_diferidos
+│
+├─ UPDATE pr_creditos_dif_hi (tabla histórica, solo p_fecha):
+│     mismos campos + saldo_interes_dif -= interes_diferidos
+│
+├─ Empresa 1 (BUSA): lee parámetros contables de param_dinam
+│     (tp1cod1=970, tp1corr1=2)
+│
+└─ PR.DESEMBOLSOS.PR_INTERFACE_CONTA (transacción 220, signo '+')
+      → genera asiento contable
+   Cg_Utl.Cuadre_Asiento → verifica que asiento cuadre
+Bloque 2: Diferidos totalmente pagados capital (saldo = 0)
+
+Igual al Bloque 1 PERO:
+  ✓ saldo_actual = 0  (capital ya pagado, solo quedan intereses diferidos)
+  Descripción: 'CASTIGO DE PRODUCTOS *TDIFERIDOS MORA >90 Y/0 CALIF >D'
+  Asiento contable SEPARADO (vp_numero_asiento_dif)
+Bloque 3: Diferidos POST 2025 — Ley 1670 (saldo > 0)
+
+Fuente: pr_creditos_hi + pr_cred_dif_post_hi  ← tabla nueva
+
+Misma lógica que Bloque 1 PERO:
+  UPDATE PR_CREDITOS_DIF_POST (vigente)
+  UPDATE pr_cred_dif_post_hi (histórico)
+  Observaciones en PR_DET_CAST_PROD_DIF: 'PR0047-POST'
+  Descripción: 'CASTIGO DE PRODUCTOS *DIFERIDOS POST 2025 MORA >90 Y/0 CALIF >D'
+Bloque 4: Diferidos POST 2025 — Ley 1670 (saldo = 0)
+
+Igual al Bloque 3 PERO:
+  ✓ saldo_actual = 0
+  Descripción: 'CASTIGO DE PRODUCTOS *TDIFERIDOS POST 2025 MORA >90 Y/0 CALIF >D'
+  Asiento contable SEPARADO (vp_numero_asiento_tpost)
+Cierre del procedimiento
+
+-- Al terminar los 4 bloques, actualiza parámetro de control:
+UPDATE parametros_x_empresa
+   SET valor = TO_CHAR(P_FECHA, 'dd/mm/yyyy')
+ WHERE abrev_parametro = 'FEC_ULT_CAST_PRO_DIF'
+   AND cod_empresa = p_empresa;
+-- Esto impide que se ejecute dos veces para la misma fecha
+El movimiento contable
+Por cada crédito castigado, la operación es:
+
+
+ANTES del castigo:
+  monto_interes_dif      = 1,000  (diferido pendiente)
+  interes_castigado      =     0
+  interes_suspenso       =     0
+  interes_corriente      = 1,000
+
+DESPUÉS del castigo (interes_diferidos = 1,000):
+  monto_interes_dif      =     0  (- 1,000)
+  interes_castigado      = 1,000  (+ 1,000)
+  interes_suspenso       = 1,000  (+ 1,000)
+  interes_corriente      =     0  (- 1,000)
+
+Asiento contable (transacción 220):
+  DÉBITO:  Intereses en suspenso diferidos castigados
+  CRÉDITO: Intereses diferidos por cobrar
+Las 4 tablas de diferidos y por qué existen
+
+┌──────────────────────┬──────────────────────┬─────────────────────────┐
+│ Tabla vigente        │ Tabla histórica       │ Descripción             │
+├──────────────────────┼──────────────────────┼─────────────────────────┤
+│ pr_creditos_dif      │ pr_creditos_dif_hi   │ Diferidos pre-Ley 1670  │
+│                      │                      │ (créditos hasta 2024)   │
+├──────────────────────┼──────────────────────┼─────────────────────────┤
+│ PR_CREDITOS_DIF_POST │ pr_cred_dif_post_hi  │ Diferidos post-Ley 1670 │
+│                      │                      │ (créditos desde 2025)   │
+└──────────────────────┴──────────────────────┴─────────────────────────┘
+Resumen del flujo completo y dependencias
+
+[pr_calif_automatica]
+    │  Clasifica cada crédito por mora, ejecución,
+    │  reprogramación, entes prohibidos
+    │  → escribe pr_his_calif_x_pr_tramite (num_proceso A)
+    ▼
+[PR_CONTAGIO]
+    │  Propaga la peor calificación al resto de
+    │  trámites del mismo cliente (y entre empresas)
+    │  → actualiza pr_his_calif_x_pr_tramite
+    ▼
+[PR_PROVISIONES] ← PROVISIONADO='S'
+    │  Registra que el proceso num_proceso A terminó
+    ▼
+[PR0047 Form] — usuario presiona botón
+    │  Busca MAX(NUM_PROCESO) de PR_PROVISIONES ← posible bug
+    ▼
+[PR_CASTIGO_PROD_DIF]
+    │  Bloque 1: diferidos vigentes (saldo > 0)
+    │  Bloque 2: diferidos totales (saldo = 0)
+    │  Bloque 3: diferidos POST-2025 (saldo > 0)
+    │  Bloque 4: diferidos totales POST-2025 (saldo = 0)
+    │
+    │  Cada bloque:
+    │    1. Verifica calificación via EXISTS en pr_his_calif_x_pr_tramite
+    │    2. Inserta detalle en PR_DET_CAST_PROD_DIF (solo emp. 11 y 5)
+    │    3. Actualiza pr_creditos_dif / pr_cred_dif_post_hi
+    │    4. Genera asiento via PR_INTERFACE_CONTA (transac. 220)
+    │    5. Verifica cuadre con Cg_Utl.Cuadre_Asiento
+    ▼
+[parametros_x_empresa] FEC_ULT_CAST_PRO_DIF = p_fecha
+    (control de doble ejecución)
+Controles de seguridad del proceso
+Control	Dónde	Propósito
+fec_ult_cast_dif = fecha	Formulario	Aviso si ya se ejecutó para esa fecha
+cast_diferido = 'S'	Variable del form	Bloquea doble ejecución en sesión
+FEC_ULT_CAST_PRO_DIF	parametros_x_empresa	Registro persistente de última ejecución
+PROVISIONADO = 'S'	PR_PROVISIONES	Solo procesa si provisión está completa
+Errores -1 a -13	P_ERROR OUT	Rollback inmediato al primer error
+Cg_Utl.Cuadre_Asiento	Por cada crédito	Valida que el asiento contable cuadre

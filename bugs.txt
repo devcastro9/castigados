@@ -1,0 +1,85 @@
+Los 3 bugs encontrados (decodificado del .fmt)
+Bug 1 — MAX(NUM_PROCESO) sin filtro de fecha (afecta AMBOS)
+Presente en PRINCIPAL_DIF (program unit del form) y en el trigger de EJECUTAR_DIF (que pasa el valor a PR_CASTIGO_PROD_DIF):
+
+
+-- Código encontrado en el .fmt (PRINCIPAL_DIF y trigger EJECUTAR_DIF):
+SELECT MAX(NUM_PROCESO)
+  INTO vl_NumProceso
+  FROM PR_PROVISIONES
+ WHERE COD_EMPRESA = :variables.codeampresa
+   AND PROVISIONADO = 'S';
+   -- ← SIN FILTRO DE FECHA
+Si el proceso de mayor número en PR_PROVISIONES corresponde a otro mes, el EXISTS en el castigo valida calificaciones de ese proceso anterior. Créditos que ANTES tenían D/E/F o mora>90 pero ya se recuperaron, son castigados incorrectamente.
+
+Bug 2 — Empresa HARDCODEADA en EXISTS (afecta diferidos)
+Encontrado dentro de PRINCIPAL_DIF en la condición del cursor:
+
+
+-- Código encontrado en PRINCIPAL_DIF del .fmt:
+and exists (select 1
+              from pr_his_calif_x_pr_tramite calif
+             where CALIF.COD_EMPRESA = '1'    -- ← HARDCODED '1' (BUSA)
+               and calif.num_proceso = vl_NumProceso
+               and calif.num_tramite = to_number(H.num_tramite)
+               and (CALIF.COD_CALIF >= 'D' OR CALIF.NUM_DIAS_MORA > 90))
+El problema: cuando el proceso corre para empresa '5' (BDP) o '11' (Fassil), el EXISTS busca clasificaciones de empresa '1' (BUSA). Esto puede:
+
+Encontrar trámites de otra empresa con el mismo num_tramite que sí tienen D/E/F → castiga créditos de empresa 5/11 que no lo merecen.
+No encontrar ningún registro si los num_tramite no coinciden → no castiga nada (error silencioso en dirección opuesta).
+La versión correcta (en PR_CASTIGO_PROD_DIF la DB procedure) usa p_empresa como parámetro. El form-level usa '1' literal.
+
+Bug 3 — Operador >= 'D' en lugar de IN ('D','E','F') (afecta diferidos form-level)
+También en PRINCIPAL_DIF:
+
+
+-- PRINCIPAL_DIF (form): operador >= sobre string
+and (CALIF.COD_CALIF >= 'D' OR CALIF.NUM_DIAS_MORA > 90)
+
+-- PR_CASTIGO_PROD_DIF (DB procedure): correcto
+and (CALIF.COD_CALIF IN ('D','E','F') or CALIF.NUM_DIAS_MORA > 90)
+En Oracle con orden alfabético, >= 'D' incluye G, H y cualquier carácter con mayor valor ASCII además de D, E, F. Esto amplía incorrectamente el universo de créditos castigados.
+
+Mapa completo de bugs por ruta de ejecución
+
+Botón "Ejecutar Castigo" (no diferidos)
+    └── PRINCIPAL (program unit)
+            ├── Bug 1: MAX(NUM_PROCESO) sin fecha  ← confirmar en hex de PRINCIPAL
+            └── ¿Bug 2?: empresa hardcodeada        ← revisar PRINCIPAL
+
+Botón "Ejecutar Castigo Diferido"
+    ├── Trigger WHEN-BUTTON-PRESSED
+    │       └── Bug 1: MAX(NUM_PROCESO) sin fecha
+    │           → pasa vl_NumProceso a PR_CASTIGO_PROD_DIF
+    │
+    └── PR.PR_CASTIGO_PROD_DIF (procedure en BD)
+            └── Recibe p_num_proceso incorrecto del form
+                → EXISTS filtra con proceso de otro mes
+
+    Y además:
+    └── PRINCIPAL_DIF (program unit en form)
+            ├── Bug 1: MAX(NUM_PROCESO) sin fecha
+            ├── Bug 2: CALIF.COD_EMPRESA = '1' hardcoded
+            └── Bug 3: >= 'D' en lugar de IN ('D','E','F')
+¿Por qué afecta a no diferidos también?
+La nota.txt confirma que las reversiones de Feb/Mar 2026 se dieron por "castigo de créditos que no cumplían condición". Dado que el Bug 1 es idéntico en ambas rutas (diferidos y no diferidos), es la causa común:
+
+
+Escenario típico Feb/Mar 2026:
+  Enero 2026:  NUM_PROCESO = 1800, PROVISIONADO='S' (algunos créditos en D)
+  Febrero 2026: NUM_PROCESO = 2050, PROVISIONADO='S'
+  
+  Al ejecutar castigo en Febrero:
+    MAX(NUM_PROCESO) WHERE PROVISIONADO='S' → devuelve 2050  ← correcto IF los num_proceso coinciden
+    
+  PERO si en Febrero se crea un nuevo proceso de calificación con NUM_PROCESO = 2100
+  y el castigo se ejecuta ANTES de que ese proceso tenga PROVISIONADO='S':
+    MAX devuelve 2050 (enero) mientras P_FECHA = 28/02/2026
+    → el EXISTS lee clasificaciones de ENERO para créditos de FEBRERO
+    → créditos que en enero tenían D pero en febrero ya son B → castigados incorrectamente
+Correcciones necesarias
+Bug	Corrección
+1 — MAX sin fecha (ambos)	Agregar AND fec_ult_calificacion = :variables.fecha en la query de PR_PROVISIONES
+2 — Empresa hardcodeada (PRINCIPAL_DIF)	Reemplazar '1' por :variables.codeampresa
+3 — Operador >= 'D' (PRINCIPAL_DIF)	Cambiar a IN ('D','E','F')
+Los bugs 2 y 3 solo requieren corrección en el form PR0047. El bug 1 requiere corrección tanto en el form como posiblemente en PR_CASTIGO_PROD_DIF si se quiere que la validación sea autónoma sin depender del form.
